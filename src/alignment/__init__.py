@@ -16,6 +16,7 @@ from .model_utils import (
 __all__ = [
     "DataArguments",
     "DPOConfig",
+    "CPOConfig",
     "H4ArgumentParser",
     "ModelArguments",
     "SFTConfig",

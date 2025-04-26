@@ -258,6 +258,23 @@ class SFTConfig(trl.SFTConfig):
 
 
 @dataclass
+class CPOConfig(trl.CPOConfig):
+    """
+    Arguments related to the CPO training process itself. For all parameters, see: https://huggingface.co/docs/transformers/v4.39.3/en/main_classes/trainer#transformers.TrainingArguments
+    """
+
+    hub_model_revision: Optional[str] = field(
+        default="main",
+        metadata={"help": ("The Hub model branch to push the model to.")},
+    )
+    logging_first_step: bool = field(
+        default=True,
+        metadata={"help": ("Whether to log and evaluate the first global_step or not.")},
+    )
+    optim: Optional[str] = field(default="rmsprop")
+    remove_unused_columns: bool = field(default=False)
+
+@dataclass
 class DPOConfig(trl.DPOConfig):
     """
     Arguments related to the DPO training process itself. For all parameters, see: https://huggingface.co/docs/transformers/v4.39.3/en/main_classes/trainer#transformers.TrainingArguments
