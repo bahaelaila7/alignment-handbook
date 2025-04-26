@@ -106,6 +106,7 @@ def get_peft_config(model_args: ModelArguments) -> PeftConfig | None:
         task_type="CAUSAL_LM",
         target_modules=model_args.lora_target_modules,
         modules_to_save=model_args.lora_modules_to_save,
+        use_dora=model_args.use_dora,
     )
 
     return peft_config

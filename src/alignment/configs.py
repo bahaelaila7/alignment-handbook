@@ -159,6 +159,10 @@ class ModelArguments:
         default=False,
         metadata={"help": ("Whether to use PEFT or not for training.")},
     )
+    use_dora: Optional[bool] = field(
+        default=False,
+        metadata={"help": ("Whether to use DoRA or LoRA")},
+    )
     lora_r: Optional[int] = field(
         default=16,
         metadata={"help": ("LoRA R value.")},

@@ -49,6 +49,17 @@ logger = logging.getLogger(__name__)
 def main():
     parser = H4ArgumentParser((ModelArguments, DataArguments, SFTConfig))
     model_args, data_args, training_args = parser.parse()
+    """
+    from pprint import pprint
+    print("Model Args", "="*80)
+    pprint(model_args)
+    print("Data Args", "="*80)
+    pprint(data_args)
+    print("Training Args", "="*80)
+    pprint(training_args)
+
+    raise Exception()
+    """
 
     # Set seed for reproducibility
     set_seed(training_args.seed)
@@ -124,6 +135,8 @@ def main():
     # For ChatML we need to add special tokens and resize the embedding layer
     if "<|im_start|>" in tokenizer.chat_template and "gemma-tokenizer-chatml" not in tokenizer.name_or_path:
         model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template is not None:
+            tokenizer.chat_template = None  # Reset the chat template
         model, tokenizer = setup_chat_format(model, tokenizer)
         model_kwargs = None
 
@@ -164,16 +177,11 @@ def main():
     ########################
     trainer = SFTTrainer(
         model=model,
-        model_init_kwargs=model_kwargs,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        dataset_text_field="text",
-        max_seq_length=training_args.max_seq_length,
-        tokenizer=tokenizer,
-        packing=True,
+        processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
-        dataset_kwargs=training_args.dataset_kwargs,
     )
 
     ###############
