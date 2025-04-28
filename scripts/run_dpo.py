@@ -190,17 +190,11 @@ def main():
     trainer = DPOTrainer(
         model,
         ref_model,
-        model_init_kwargs=model_kwargs,
-        ref_model_init_kwargs=ref_model_kwargs,
         args=training_args,
-        beta=training_args.beta,
         train_dataset=raw_datasets["train"],
         eval_dataset=raw_datasets["test"],
-        tokenizer=tokenizer,
-        max_length=training_args.max_length,
-        max_prompt_length=training_args.max_prompt_length,
+        processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
-        loss_type=training_args.loss_type,
     )
 
     ###############
