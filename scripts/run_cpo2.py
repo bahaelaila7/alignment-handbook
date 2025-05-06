@@ -13,25 +13,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Supervised fine-tuning script for decoder language models.
-"""
-
 import logging
 import random
 import sys
 import os
 
-import datasets
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, set_seed
 
 from alignment import (
     DataArguments,
+    CPOConfig,
     H4ArgumentParser,
     ModelArguments,
-    SFTConfig,
     apply_chat_template,
     decontaminate_humaneval,
     get_checkpoint,
@@ -40,8 +35,10 @@ from alignment import (
     get_peft_config,
     get_quantization_config,
     get_tokenizer,
+    is_adapter_model,
 )
-from trl import SFTTrainer, setup_chat_format
+from peft import PeftConfig, PeftModel
+from trl import CPO2Trainer
 
 
 logger = logging.getLogger(__name__)
@@ -49,26 +46,12 @@ os.environ['HF_DATASETS_OFFLINE'] = '1'
 
 
 def main():
-    parser = H4ArgumentParser((ModelArguments, DataArguments, SFTConfig))
+    parser = H4ArgumentParser((ModelArguments, DataArguments, CPOConfig))
     model_args, data_args, training_args = parser.parse()
-    """
-    from pprint import pprint
-    print("Model Args", "="*80)
-    pprint(model_args)
-    print("Data Args", "="*80)
-    pprint(data_args)
-    print("Training Args", "="*80)
-    pprint(training_args)
 
-    raise Exception()
-    """
-
-    # Set seed for reproducibility
-    set_seed(training_args.seed)
-
-    ###############
-    # Setup logging
-    ###############
+    #######
+    # Setup
+    #######
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -76,16 +59,11 @@ def main():
     )
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
-    # Log on each process a small summary
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
-    )
+    # Log on each process the small summary:
     logger.info(f"Model parameters {model_args}")
     logger.info(f"Data parameters {data_args}")
     logger.info(f"Training/evaluation parameters {training_args}")
@@ -94,6 +72,9 @@ def main():
     last_checkpoint = get_checkpoint(training_args)
     if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
+
+    # Set seed for reproducibility
+    set_seed(training_args.seed)
 
     ###############
     # Load datasets
@@ -105,19 +86,61 @@ def main():
         columns_to_keep=["messages", "chosen", "rejected", "prompt", "completion", "label"],
     )
     logger.info(
-        f"Training on the following datasets and their proportions: {[split + ' : ' + str(dset.num_rows) for split, dset in raw_datasets.items()]}"
+        f"Training on the following splits: {[split + ' : ' + str(dset.num_rows) for split, dset in raw_datasets.items()]}"
     )
     column_names = list(raw_datasets["train"].features)
 
-    ################
-    # Load tokenizer
-    ################
+    #####################################
+    # Load tokenizer and process datasets
+    #####################################
+    data_args.truncation_side = "left"  # Truncate from left to ensure we don't lose labels in final turn
     tokenizer = get_tokenizer(model_args, data_args)
+    #raise Exception(tokenizer.get_chat_template())
 
-    #######################
-    # Load pretrained model
-    #######################
-    logger.info("*** Load pretrained model ***")
+    #####################
+    # Apply chat template
+    #####################
+    raw_datasets = raw_datasets.map(
+        apply_chat_template,
+        fn_kwargs={
+            "tokenizer": tokenizer,
+            "task": "dpo",
+            "auto_insert_empty_system_msg": data_args.auto_insert_empty_system_msg,
+        },
+        num_proc=data_args.preprocessing_num_workers,
+        remove_columns=column_names,
+        desc="Formatting comparisons with prompt template",
+    )
+
+    ##########################
+    # Decontaminate benchmarks
+    ##########################
+    num_raw_train_samples = len(raw_datasets["train"])
+    raw_datasets = raw_datasets.filter(
+        decontaminate_humaneval,
+        fn_kwargs={"text_column": "text_chosen"},
+        batched=True,
+        batch_size=10_000,
+        num_proc=1,
+        desc="Decontaminating HumanEval samples",
+    )
+    num_filtered_train_samples = num_raw_train_samples - len(raw_datasets["train"])
+    logger.info(
+        f"Decontaminated {num_filtered_train_samples} ({num_filtered_train_samples/num_raw_train_samples * 100:.2f}%) samples from the training set."
+    )
+
+    # Replace column names with what TRL needs, text_chosen -> chosen and text_rejected -> rejected
+    for split in ["train", "test"]:
+        raw_datasets[split] = raw_datasets[split].rename_columns(
+            {"text_prompt": "prompt", "text_chosen": "chosen", "text_rejected": "rejected"}
+        )
+
+    # Log a few random samples from the training set:
+    for index in random.sample(range(len(raw_datasets["train"])), 3):
+        logger.info(f"Prompt sample {index} of the raw training set:\n\n{raw_datasets['train'][index]['prompt']}")
+        logger.info(f"Chosen sample {index} of the raw training set:\n\n{raw_datasets['train'][index]['chosen']}")
+        logger.info(f"Rejected sample {index} of the raw training set:\n\n{raw_datasets['train'][index]['rejected']}")
+
     torch_dtype = (
         model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
     )
@@ -134,54 +157,44 @@ def main():
     )
 
     model = model_args.model_name_or_path
-    # For ChatML we need to add special tokens and resize the embedding layer
-    if "<|im_start|>" in tokenizer.chat_template and "gemma-tokenizer-chatml" not in tokenizer.name_or_path:
-        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
-        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template is not None:
-            tokenizer.chat_template = None  # Reset the chat template
-        model, tokenizer = setup_chat_format(model, tokenizer)
+    if is_adapter_model(model, model_args.model_revision) is True:
+        logger.info(f"Loading SFT adapter for {model_args.model_name_or_path=}")
+        peft_config = PeftConfig.from_pretrained(model_args.model_name_or_path, revision=model_args.model_revision)
+        model_kwargs = dict(
+            revision=model_args.base_model_revision,
+            trust_remote_code=model_args.trust_remote_code,
+            attn_implementation=model_args.attn_implementation,
+            torch_dtype=torch_dtype,
+            use_cache=False if training_args.gradient_checkpointing else True,
+            device_map=get_kbit_device_map() if quantization_config is not None else None,
+            quantization_config=quantization_config,
+        )
+        base_model = AutoModelForCausalLM.from_pretrained(
+            peft_config.base_model_name_or_path,
+            **model_kwargs,
+        )
+        model = PeftModel.from_pretrained(
+            base_model,
+            model_args.model_name_or_path,
+            revision=model_args.model_revision,
+        )
         model_kwargs = None
 
-    #####################
-    # Apply chat template
-    #####################
-    raw_datasets = raw_datasets.map(
-        apply_chat_template,
-        fn_kwargs={
-            "tokenizer": tokenizer,
-            "task": "sft",
-            "auto_insert_empty_system_msg": data_args.auto_insert_empty_system_msg,
-        },
-        num_proc=data_args.preprocessing_num_workers,
-        remove_columns=column_names,
-        desc="Applying chat template",
-    )
+    ref_model = model
+    ref_model_kwargs = model_kwargs
 
-    ##########################
-    # Decontaminate benchmarks
-    ##########################
-    num_raw_train_samples = len(raw_datasets["train"])
-    raw_datasets = raw_datasets.filter(decontaminate_humaneval, batched=True, batch_size=10_000, num_proc=1)
-    num_filtered_train_samples = num_raw_train_samples - len(raw_datasets["train"])
-    logger.info(
-        f"Decontaminated {num_filtered_train_samples} ({num_filtered_train_samples/num_raw_train_samples * 100:.2f}%) samples from the training set."
-    )
+    if model_args.use_peft is True:
+        ref_model = None
+        ref_model_kwargs = None
 
-    train_dataset = raw_datasets["train"]
-    eval_dataset = raw_datasets["test"]
-
-    with training_args.main_process_first(desc="Log a few random samples from the processed training set"):
-        for index in random.sample(range(len(raw_datasets["train"])), 3):
-            logger.info(f"Sample {index} of the processed training set:\n\n{raw_datasets['train'][index]['text']}")
-
-    ########################
-    # Initialize the Trainer
-    ########################
-    trainer = SFTTrainer(
-        model=model,
+    #########################
+    # Instantiate CPO trainer
+    #########################
+    trainer = CPO2Trainer(
+        model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        train_dataset=raw_datasets["train"],
+        eval_dataset=raw_datasets["test"],
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
     )
@@ -189,7 +202,6 @@ def main():
     ###############
     # Training loop
     ###############
-    logger.info("*** Train ***")
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
         checkpoint = training_args.resume_from_checkpoint
@@ -197,10 +209,12 @@ def main():
         checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     metrics = train_result.metrics
-    metrics["train_samples"] = len(train_dataset)
+    metrics["train_samples"] = len(raw_datasets["train"])
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
+
+    logger.info("*** Training complete ***")
 
     ##################################
     # Save model and create model card
@@ -228,7 +242,7 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(eval_dataset)
+        metrics["eval_samples"] = len(raw_datasets["test"])
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
@@ -236,7 +250,7 @@ def main():
         logger.info("Pushing to hub...")
         trainer.push_to_hub(**kwargs)
 
-    logger.info("*** Training complete ***")
+    logger.info("*** Training complete! ***")
 
 
 if __name__ == "__main__":

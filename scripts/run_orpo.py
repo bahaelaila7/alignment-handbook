@@ -17,6 +17,7 @@
 import logging
 import random
 import sys
+import os
 from typing import Any, Dict
 
 import torch
@@ -40,6 +41,7 @@ from trl import ORPOConfig, ORPOTrainer, setup_chat_format
 
 
 logger = logging.getLogger(__name__)
+os.environ['HF_DATASETS_OFFLINE'] = '1'
 
 
 def main():

@@ -16,6 +16,7 @@
 import logging
 import random
 import sys
+import os
 
 import torch
 import transformers
@@ -41,6 +42,7 @@ from trl import DPOTrainer
 
 
 logger = logging.getLogger(__name__)
+os.environ['HF_DATASETS_OFFLINE'] = '1'
 
 
 def main():

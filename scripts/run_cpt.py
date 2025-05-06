@@ -20,6 +20,7 @@ Continued pretraining script for decoder language models.
 import logging
 import random
 import sys
+import os
 
 import datasets
 import torch
@@ -42,6 +43,7 @@ from trl import SFTTrainer
 
 
 logger = logging.getLogger(__name__)
+os.environ['HF_DATASETS_OFFLINE'] = '1'
 
 
 def main():
